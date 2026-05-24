@@ -1,6 +1,12 @@
 """
-无线仿真环境: Rician信道 + 3GPP UMi路径损耗 + M/M/1队列 + Wi-Fi LBT共存
+无线仿真环境 v2.0: 多UE竞争 + Rician信道 + 3GPP UMi路径损耗 + M/M/1队列 + Wi-Fi LBT共存
 基于 Chou et al., arXiv:2509.06775, 2025.
+
+v2.0 新增:
+  - 多UE竞争: N个V2V pair共享同一资源池, 同模式带宽均分+干扰
+  - 动态剩余资源比: 状态中的5个模式可用性根据上一轮使用量实时变化
+  - HOL延迟约束: 超时丢包 (deadline=50ms), 计入阻塞率
+  - CMDP奖励: r = 实际吞吐 − β·I(阻塞事件), β通过对偶梯度更新
 """
 
 import numpy as np
@@ -13,7 +19,8 @@ from config import (
     UNLICENSED_BW_MBPS, NUM_LICENSED_MODES,
     PACKET_SIZE_BITS, QUEUE_MAX_CAPACITY, EPOCH_DURATION,
     WIFI_TX_PROB, WIFI_IDLE_CORRELATION,
-    ACTION_DIM, STATE_DIM,
+    ACTION_DIM, STATE_DIM, NUM_UE, DEADLINE_STEPS,
+    INTERFERENCE_COUPLING, COORD_PENALTY_WEIGHT,
 )
 
 # Boltzmann常数
@@ -102,12 +109,12 @@ ACTION_INFO = {
 }
 
 
-def get_mode_bandwidth(action, licensed_bw_total):
-    """返回指定动作对应的带宽 (Mbps)."""
+def get_mode_bandwidth(action, licensed_bw_total, num_users=1):
+    """返回指定动作的每UE带宽 (Mbps), 考虑同模式用户均分."""
     if action in (0, 1, 2, 3):
-        return licensed_bw_total / NUM_LICENSED_MODES
+        return licensed_bw_total / NUM_LICENSED_MODES / num_users
     else:  # action == 4 (SL-U-5G)
-        return UNLICENSED_BW_MBPS
+        return UNLICENSED_BW_MBPS / num_users
 
 
 def get_mode_snr_db(action):
@@ -151,174 +158,265 @@ class WiFiCoexistence:
 
 
 # ============================================================
-# 主环境类
+# 主环境类 — 多UE竞争版
 # ============================================================
 class SidelinkEnv:
     """
-    NR Sidelink 调度仿真环境.
-    状态 (7维):
+    NR Sidelink 调度仿真环境 (多UE竞争).
+
+    状态 (8维):
       [0] 归一化队列占用率 (0~1)
-      [1] CC-28G 剩余资源比
+      [1] CC-28G 剩余资源比 (基于上轮使用量, 动态)
       [2] CC-26G 剩余资源比
       [3] SL-L-28G 剩余资源比
       [4] SL-L-26G 剩余资源比
       [5] SL-U-5G 剩余资源比
-      [6] Wi-Fi 空闲概率
+      [6] Wi-Fi 空闲指示 (0/1)
+      [7] HOL等待时间/截止时间 (归一化紧急度)
 
     动作 (5): CC-28G, CC-26G, SL-L-28G, SL-L-26G, SL-U-5G
+
+    多UE机制:
+      - N个UE各自维护独立队列, 每个epoch独立选择动作
+      - 同模式多用户 → 带宽均分 + 干扰惩罚
+      - 上轮模式使用量决定下轮状态的剩余资源比
+      - 数据包超时 (DEADLINE_STEPS) → 丢弃计入阻塞
+
+    CMDP奖励:
+      r_i = actual_throughput_i − β · I(blocking_event_i)
+      β 由外部通过对偶梯度更新 (见 ddqn_agent.update_beta)
     """
 
-    def __init__(self, licensed_bw_total=500.0, arrival_rate=0.5,
+    def __init__(self, num_ue=NUM_UE, licensed_bw_total=500.0, arrival_rate=1.5,
                  seed=None, dynamic_channel=True):
-        """
-        licensed_bw_total: 授权频段总带宽 (Mbps)
-        arrival_rate: Poisson 到达率 λ
-        dynamic_channel: True→每包新信道; False→每episode固定信道
-        """
+        self.num_ue = num_ue
         self.licensed_bw = licensed_bw_total
         self.arrival_rate = arrival_rate
         self.dynamic_channel = dynamic_channel
-
-        # RNG
         self.rng = np.random.RandomState(seed)
-
-        # Wi-Fi 共存
         self.wifi = WiFiCoexistence()
-
-        # 队列
-        self.queue = []
         self.queue_max = QUEUE_MAX_CAPACITY
 
-        # 统计
-        self.total_arrivals = 0
-        self.total_blocked = 0
-        self.total_transmitted = 0
-        self.episode_rewards = []
+        # ---- Per-UE 队列: 每元素 = arrival_step ----
+        self.queues = [[] for _ in range(num_ue)]
+
+        # ---- Per-UE 统计 ----
+        self.total_arrivals = np.zeros(num_ue, dtype=int)
+        self.total_blocked = np.zeros(num_ue, dtype=int)
+        self.total_transmitted = np.zeros(num_ue, dtype=int)
+
+        # ---- 上轮模式使用量 (用于构建状态的剩余资源比) ----
+        self.prev_mode_usage = np.zeros(5, dtype=int)
+
+        # ---- CMDP 拉格朗日乘子 ----
+        self.beta = 0.0
+
+        # ---- 当前步计数 (用于HOL计算) ----
+        self.current_step = 0
+
+        # ---- 每UE每步奖励记录 ----
+        self.step_rewards = []
 
     def reset(self):
-        """重置环境状态 (每个episode开始)."""
-        self.queue = []
-        self.total_arrivals = 0
-        self.total_blocked = 0
-        self.total_transmitted = 0
-        self.episode_rewards = []
+        """重置环境状态 (每个episode开始). 返回所有UE的初始状态列表."""
+        self.queues = [[] for _ in range(self.num_ue)]
+        self.total_arrivals = np.zeros(self.num_ue, dtype=int)
+        self.total_blocked = np.zeros(self.num_ue, dtype=int)
+        self.total_transmitted = np.zeros(self.num_ue, dtype=int)
+        self.prev_mode_usage = np.zeros(5, dtype=int)
         self.wifi.state = 0
-        return self._get_state()
+        self.current_step = 0
+        self.step_rewards = []
+        return [self._get_state(i) for i in range(self.num_ue)]
 
-    def _get_state(self):
-        """构建7维状态向量."""
-        q_ratio = len(self.queue) / self.queue_max if self.queue_max > 0 else 0.0
+    def _get_state(self, ue_id):
+        """构建单个UE的8维观测状态."""
+        q_ratio = len(self.queues[ue_id]) / self.queue_max if self.queue_max > 0 else 0.0
 
-        # 剩余资源比: 简化版设为1.0 (无带内竞争)
+        # 动态剩余资源比: 基于上轮模式使用量
+        # 剩余比 = 1 / prev_users, 限制在 [0.1, 1.0]
         residual_ratios = np.ones(5, dtype=np.float32)
-        # SL-U 的剩余比率受 Wi-Fi 状态影响
-        residual_ratios[4] = 1.0 - self.wifi.tx_prob * 0.5
+        for m in range(5):
+            if self.prev_mode_usage[m] > 0:
+                residual_ratios[m] = max(0.1, 1.0 / self.prev_mode_usage[m])
+        # SL-U额外受Wi-Fi影响
+        residual_ratios[4] *= max(0.3, 1.0 - self.wifi.tx_prob)
 
         wifi_idle = float(self.wifi.is_idle())
 
-        state = np.array([
+        # HOL等待时间 (归一化)
+        if len(self.queues[ue_id]) > 0:
+            hol_arrival = self.queues[ue_id][0]
+            hol_wait = min(1.0, (self.current_step - hol_arrival) / DEADLINE_STEPS)
+        else:
+            hol_wait = 0.0
+
+        return np.array([
             q_ratio,
             *residual_ratios,
             wifi_idle,
+            hol_wait,
         ], dtype=np.float32)
-        return state
 
     def _generate_arrivals(self):
-        """Poisson 到达生成."""
-        n_arrivals = self.rng.poisson(self.arrival_rate)
-        n_blocked = 0
-        for _ in range(n_arrivals):
-            if len(self.queue) < self.queue_max:
-                self.queue.append(PACKET_SIZE_BITS)
-            else:
-                n_blocked += 1
-        self.total_arrivals += n_arrivals
-        self.total_blocked += n_blocked
-        return n_arrivals, n_blocked
+        """为所有UE生成Poisson到达. 返回每UE的 (到达数, 阻塞数)."""
+        arrivals = np.zeros(self.num_ue, dtype=int)
+        blocked = np.zeros(self.num_ue, dtype=int)
+        for ue_id in range(self.num_ue):
+            n = self.rng.poisson(self.arrival_rate)
+            arrivals[ue_id] = n
+            for _ in range(n):
+                if len(self.queues[ue_id]) < self.queue_max:
+                    self.queues[ue_id].append(self.current_step)
+                else:
+                    blocked[ue_id] += 1
+            self.total_arrivals[ue_id] += n
+            self.total_blocked[ue_id] += blocked[ue_id]
+        return arrivals, blocked
 
-    def _compute_sinr(self, action):
+    def _compute_sinr(self, action, num_users_on_mode):
         """
-        计算瞬时 SINR (线性值).
-        基于平均SNR + Rician衰落 + 路径损耗变化.
+        计算考虑多用户干扰的瞬时SINR (线性值).
+        SINR_eff = SNR_base × |H|² / (1 + α·(K-1))
+        其中 K = 同模式用户数, α = 干扰耦合系数.
         """
         _, freq_key, mode_type, snr_mean_db = ACTION_INFO[action]
         is_mmwave = (freq_key != "5G")
 
-        # Rician 信道增益 |H|^2
         h = rician_fading(RICIAN_K, is_mmwave)
         channel_gain = np.abs(h) ** 2
-
-        # 平均 SNR (线性)
         snr_mean_lin = db_to_linear(snr_mean_db)
-
-        # 瞬时 SINR = 平均SNR × |H|^2 (衰落围绕均值波动)
         sinr_linear = snr_mean_lin * channel_gain
+
+        # 多用户干扰: SINR随用户数增加而衰减
+        if num_users_on_mode > 1:
+            sinr_linear /= (1.0 + INTERFERENCE_COUPLING * (num_users_on_mode - 1))
+
         return max(sinr_linear, 1e-10)
 
-    def step(self, action):
+    def step(self, actions):
         """
-        执行一个决策epoch.
-        action: 0-4
-        返回: (next_state, reward, done, info)
+        执行一个决策epoch (所有UE同时).
+        actions: list of N ints (0~4)
+        返回: (next_states, rewards, done, infos)
         """
-        info = {"blocked_arrival": 0, "blocked_transmit": 0, "n_served": 0}
+        if len(actions) != self.num_ue:
+            raise ValueError(f"需要 {self.num_ue} 个动作, 收到 {len(actions)}")
 
         # ---- 1. Poisson 到达 ----
-        _, blocked_arrival = self._generate_arrivals()
-        info["blocked_arrival"] = blocked_arrival
+        arrivals, arrival_blocked = self._generate_arrivals()
 
         # ---- 2. Wi-Fi 状态更新 ----
         self.wifi.step()
 
-        # ---- 3. 传输决策 ----
-        reward = 0.0
-        if len(self.queue) > 0:
+        # ---- 3. 统计本轮模式选择 ----
+        mode_usage = np.zeros(5, dtype=int)
+        for a in actions:
+            mode_usage[a] += 1
+
+        # ---- 4. 处理每个UE的传输 ----
+        rewards = [0.0] * self.num_ue
+        infos = []
+
+        for ue_id, action in enumerate(actions):
+            queue = self.queues[ue_id]
+            info = {
+                "arrivals": int(arrivals[ue_id]),
+                "arrival_blocked": int(arrival_blocked[ue_id]),
+                "deadline_drops": 0,
+                "n_served": 0,
+                "action": action,
+            }
+
+            if len(queue) == 0:
+                infos.append(info)
+                continue
+
             _, _, mode_type, _ = ACTION_INFO[action]
 
-            # SL-U: 检查LBT
+            # LBT: SL-U在Wi-Fi忙时被阻塞
             if mode_type == "slu" and not self.wifi.is_idle():
-                info["blocked_transmit"] = 1
-            else:
-                # 计算瞬时速率
-                sinr_lin = self._compute_sinr(action)
-                bw_mbps = get_mode_bandwidth(action, self.licensed_bw)
-                bw_hz = bw_mbps * 1e6
-                rate_bps = bw_hz * np.log2(1.0 + sinr_lin)
+                infos.append(info)
+                continue
 
-                # 服务包数 = floor(rate * duration / packet_size) + 概率化分数部分
-                max_packets_per_epoch = rate_bps * EPOCH_DURATION / PACKET_SIZE_BITS
-                n_served = int(np.floor(max_packets_per_epoch))
-                frac = max_packets_per_epoch - n_served
-                if frac > 0 and self.rng.random() < frac:
-                    n_served += 1
-                n_served = min(n_served, len(self.queue))
+            # 计算SINR和速率 (考虑同模式竞争)
+            n_users = int(mode_usage[action])
+            sinr_lin = self._compute_sinr(action, n_users)
+            bw_mbps = get_mode_bandwidth(action, self.licensed_bw, n_users)
+            bw_hz = bw_mbps * 1e6
+            rate_bps = bw_hz * np.log2(1.0 + sinr_lin)
 
-                for _ in range(n_served):
-                    self.queue.pop(0)
-                self.total_transmitted += n_served
-                info["n_served"] = n_served
+            # 可服务包数
+            max_packets = rate_bps * EPOCH_DURATION / PACKET_SIZE_BITS
+            n_candidate = int(np.floor(max_packets))
+            frac = max_packets - n_candidate
+            if frac > 0 and self.rng.random() < frac:
+                n_candidate += 1
+            n_candidate = min(n_candidate, len(queue))
 
-                # 奖励 = B·log₂(1+SINR) / 1e6 (Mbps尺度)
-                reward = rate_bps / 1e6
+            # 逐包处理: 检查HOL超时
+            served = 0
+            dropped_deadline = 0
+            for _ in range(n_candidate):
+                if len(queue) == 0:
+                    break
+                arrival_step = queue[0]
+                if self.current_step - arrival_step >= DEADLINE_STEPS:
+                    queue.pop(0)
+                    dropped_deadline += 1
+                else:
+                    queue.pop(0)
+                    served += 1
 
-        self.episode_rewards.append(reward)
+            self.total_transmitted[ue_id] += served
+            self.total_blocked[ue_id] += dropped_deadline
+            info["n_served"] = served
+            info["deadline_drops"] = dropped_deadline
 
-        # ---- 4. 下一状态 ----
-        next_state = self._get_state()
+            # 奖励: 实际吞吐 − 协调惩罚 (打破多UE羊群效应)
+            actual_throughput_mbps = (served * PACKET_SIZE_BITS) / EPOCH_DURATION / 1e6
+            n_users = int(mode_usage[action])
+            if n_users > 1:
+                congestion = (n_users - 1) / (self.num_ue - 1)
+                actual_throughput_mbps -= COORD_PENALTY_WEIGHT * congestion
+            rewards[ue_id] = actual_throughput_mbps
 
-        # ---- 5. 终止判断 ----
-        done = (len(self.queue) >= self.queue_max)
+            infos.append(info)
 
-        return next_state, reward, done, info
+        # ---- 5. 保存本轮模式使用量供下轮状态使用 ----
+        self.prev_mode_usage = mode_usage
 
-    def get_blocking_rate(self):
-        """计算当前episode的阻塞率."""
-        if self.total_arrivals == 0:
+        # ---- 6. 下一状态 ----
+        self.current_step += 1
+        self.step_rewards.append(np.mean(rewards))
+        next_states = [self._get_state(i) for i in range(self.num_ue)]
+
+        # ---- 7. 终止条件: episode固定长度, 不提前终止 ----
+        # 阻塞惩罚已通过CMDP奖励体现, 提前终止会缩短探索、阻碍学习
+        done = False
+
+        return next_states, rewards, done, infos
+
+    # ============================================================
+    # 统计接口
+    # ============================================================
+    def get_blocking_rate(self, ue_id=None):
+        """返回系统平均阻塞率 (或指定UE)."""
+        if ue_id is not None:
+            if self.total_arrivals[ue_id] == 0:
+                return 0.0
+            return self.total_blocked[ue_id] / self.total_arrivals[ue_id]
+        total_a = self.total_arrivals.sum()
+        if total_a == 0:
             return 0.0
-        return self.total_blocked / self.total_arrivals
+        return self.total_blocked.sum() / total_a
 
     def get_throughput(self):
-        """计算平均吞吐量 (Mbps)."""
-        if len(self.episode_rewards) == 0:
-            return 0.0
-        return np.mean(self.episode_rewards)
+        """返回系统平均吞吐量 (Mbps)."""
+        total_bits = self.total_transmitted.sum() * PACKET_SIZE_BITS
+        total_time = max(self.current_step, 1) * EPOCH_DURATION
+        return total_bits / total_time / 1e6
+
+    def get_avg_queue_length(self):
+        """返回所有UE的平均队列长度."""
+        return np.mean([len(q) for q in self.queues])

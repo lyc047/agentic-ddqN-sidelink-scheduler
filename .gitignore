@@ -1,5 +1,5 @@
 __pycache__/
-results/
+# results/ — 不再忽略，v2.0结果需上传
 *.pyc
 auto_shutdown.bat
 shutdown_monitor.py

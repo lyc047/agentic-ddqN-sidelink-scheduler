@@ -1,13 +1,14 @@
 """
-DDQN 智能体: 双网络结构 + 优先经验回放 + ε-greedy 探索
+DDQN 智能体 v2.0: 双网络结构 + 经验回放 + ε-greedy探索 + CMDP拉格朗日对偶
 基于 Chou et al., arXiv:2509.06775, 2025.
+
+v2.0 新增: 拉格朗日乘子 β 用于CMDP约束 — 阻塞率超过目标时自动增大惩罚权重
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
 import random
 
 
@@ -21,11 +22,10 @@ class QNetwork(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.LeakyReLU(0.01),
+            nn.LayerNorm(hidden1),
             nn.Linear(hidden1, hidden2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.LeakyReLU(0.01),
             nn.Linear(hidden2, action_dim),
         )
         self._init_weights()
@@ -45,16 +45,25 @@ class QNetwork(nn.Module):
 # 经验回放缓冲区
 # ============================================================
 class ReplayBuffer:
-    """固定容量 FIFO 经验回放."""
+    """固定容量 FIFO 经验回放 (list-based, O(1) 索引)."""
 
     def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
+        self.capacity = capacity
+        self.buffer = []
+        self._pos = 0
 
     def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+        entry = (state, action, reward, next_state, done)
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(entry)
+        else:
+            self.buffer[self._pos] = entry
+            self._pos = (self._pos + 1) % self.capacity
 
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
+        n = len(self.buffer)
+        indices = np.random.randint(0, n, size=min(batch_size, n))
+        batch = [self.buffer[i] for i in indices]
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
             torch.FloatTensor(np.array(states)),
@@ -69,20 +78,12 @@ class ReplayBuffer:
 
 
 # ============================================================
-# DDQN Agent
+# DDQN Agent (v2.0: + CMDP Lagrangian)
 # ============================================================
 class DDQNAgent:
-    """Double DQN 智能体."""
+    """Double DQN 智能体 + CMDP拉格朗日对偶."""
 
     def __init__(self, state_dim, action_dim, config):
-        """
-        config: 包含所有超参数的命名空间/对象.
-        期望字段:
-          hidden_dim_1, hidden_dim_2, dropout_rate,
-          learning_rate, lr_final, gamma,
-          replay_capacity, batch_size, target_update_freq,
-          epsilon_start, epsilon_min, epsilon_decay,
-        """
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = config.GAMMA
@@ -112,67 +113,88 @@ class DDQNAgent:
         # 经验回放
         self.replay_buffer = ReplayBuffer(config.REPLAY_CAPACITY)
 
-        # ε-greedy (指数衰减: ε = max(ε_min, ε₀·e^(-t/K_decay)))
-        self.epsilon_start = config.EPSILON_START
-        self.epsilon_min   = config.EPSILON_MIN
-        self.epsilon_k_decay = config.EPSILON_K_DECAY
-        self.epsilon = self.epsilon_start
+        # Softmax (Boltzmann) 探索: 温度衰减 (v2.0, 替代ε-greedy)
+        self.temp_start = config.TEMPERATURE_START
+        self.temp_min   = config.TEMPERATURE_MIN
+        self.temp_k_decay = config.TEMPERATURE_K_DECAY
+        self.temperature = self.temp_start
         self.total_steps = 0
 
-    def select_action(self, state, training=True):
-        """ε-greedy 动作选择."""
-        if training and np.random.random() < self.epsilon:
-            return np.random.randint(self.action_dim)
+        # ---- CMDP 拉格朗日对偶 (v2.0 新增) ----
+        self.beta = 0.0
+        self.target_blocking = config.TARGET_BLOCKING
+        self.lagrangian_lr = config.LAGRANGIAN_LR
+        self.beta_update_freq = config.BETA_UPDATE_FREQ
+        self._blocking_history = []
 
+    def select_action(self, state, training=True):
+        """Softmax动作选择: 天然打破多UE羊群效应."""
         with torch.no_grad():
             state_t = torch.FloatTensor(state).unsqueeze(0)
             q_values = self.online_net(state_t)
-            return q_values.argmax(dim=1).item()
+            if training:
+                temp = max(self.temp_min, self.temperature)
+                probs = torch.softmax(q_values / temp, dim=1).numpy()[0]
+                return np.random.choice(self.action_dim, p=probs)
+            else:
+                return q_values.argmax(dim=1).item()
 
-    def update_epsilon(self):
-        """指数衰减 ε = max(ε_min, ε₀·exp(-t/K_decay)). 对应论文公式(5)."""
-        self.epsilon = max(
-            self.epsilon_min,
-            self.epsilon_start * np.exp(-self.total_steps / self.epsilon_k_decay)
+    def update_temperature(self):
+        """温度指数衰减: τ = max(τ_min, τ₀·exp(-t/K_decay))."""
+        self.temperature = max(
+            self.temp_min,
+            self.temp_start * np.exp(-self.total_steps / self.temp_k_decay)
         )
 
     def update_lr(self, progress):
-        """
-        学习率分阶段衰减.
-        progress: 0→1 训练进度.
-        """
+        """学习率线性衰减."""
         lr = self.lr_init + (self.lr_final - self.lr_init) * progress
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
+    def update_beta(self, blocking_rate, episode_num=0):
+        """
+        CMDP对偶变量更新: β ← max(0, β + η·(阻塞率 − 目标阻塞率)).
+        前2000ep为warmup期 (β=0, 专注吞吐学习); β上限20防止惩罚淹没奖励信号.
+        """
+        self._blocking_history.append(blocking_rate)
+        if len(self._blocking_history) > self.beta_update_freq:
+            self._blocking_history.pop(0)
+
+        # Warmup: 前500ep不启用阻塞惩罚 (v2.1: 缩短以适配更短训练)
+        if episode_num < 500:
+            self.beta = 0.0
+            return
+
+        if len(self._blocking_history) >= 10:
+            avg_blocking = np.mean(self._blocking_history)
+            self.beta = min(3.0, max(0.0, self.beta
+                            + self.lagrangian_lr * (avg_blocking - self.target_blocking)))
+
     def train_step(self):
         """从回放缓冲区采样并执行一次 DDQN 更新."""
         if len(self.replay_buffer) < self.batch_size:
-            return None  # 不足一个batch
+            return None
 
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(
             self.batch_size
         )
 
-        # ---- DDQN 目标值计算 (公式4) ----
-        # 在线网络选择最优动作
+        # ---- DDQN 目标值 ----
         with torch.no_grad():
             next_actions = self.online_net(next_states).argmax(dim=1, keepdim=True)
-            # 目标网络评估该动作
             next_q_values = self.target_net(next_states).gather(1, next_actions).squeeze()
-            # y^DDQN = r + γ * Q_target(s', argmax_a Q_online(s', a))
             targets = rewards + self.gamma * next_q_values * (1.0 - dones)
 
         # 当前 Q 值
         current_q = self.online_net(states).gather(1, actions.unsqueeze(1)).squeeze()
 
-        # ---- Bellman 损失 (公式3) ----
+        # Bellman 损失
         loss = nn.MSELoss()(current_q, targets)
 
-        # ---- 梯度更新 ----
+        # 梯度更新
         self.optimizer.zero_grad()
         loss.backward()
-        # 梯度裁剪防止爆炸
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
 
@@ -183,14 +205,13 @@ class DDQNAgent:
         self.target_net.load_state_dict(self.online_net.state_dict())
 
     def update(self, state, action, reward, next_state, done):
-        """存储经验并执行训练."""
+        """存储经验并执行训练步."""
         self.replay_buffer.push(state, action, reward, next_state, done)
         self.total_steps += 1
-        self.update_epsilon()
+        self.update_temperature()
 
         loss = self.train_step()
 
-        # 定期同步目标网络
         if self.total_steps % self.target_update_freq == 0:
             self.sync_target_network()
 
