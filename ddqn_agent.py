@@ -168,7 +168,7 @@ class DDQNAgent:
 
         if len(self._blocking_history) >= 10:
             avg_blocking = np.mean(self._blocking_history)
-            self.beta = min(3.0, max(0.0, self.beta
+            self.beta = min(5.0, max(0.0, self.beta
                             + self.lagrangian_lr * (avg_blocking - self.target_blocking)))
 
     def train_step(self):
